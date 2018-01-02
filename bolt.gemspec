@@ -16,7 +16,8 @@ Gem::Specification.new do |spec|
   spec.files         = Dir['exe/*'] +
                        Dir['lib/**/*.rb'] +
                        Dir['vendored/*.rb'] +
-                       Dir['vendored/*/lib/**/*.rb']
+                       Dir['vendored/*/lib/**/*.rb'] +
+                       Dir['modules/boltlib/lib/**/*.rb']
   spec.bindir        = "exe"
   spec.executables   = spec.files.grep(%r{^exe/}) { |f| File.basename(f) }
   spec.require_paths = ["lib"]
@@ -25,7 +26,7 @@ Gem::Specification.new do |spec|
 
   spec.add_dependency "addressable", '< 2.5.0'
   spec.add_dependency "concurrent-ruby", "~> 1.0"
-  spec.add_dependency "net-sftp", "~> 2.0"
+  spec.add_dependency "net-scp", "~> 1.2"
   spec.add_dependency "net-ssh", "~> 4.2"
   spec.add_dependency "orchestrator_client", "~> 0.2.1"
   spec.add_dependency "winrm", "~> 2.0"
@@ -41,6 +42,7 @@ Gem::Specification.new do |spec|
   spec.add_dependency "win32-security", "= 0.2.5"
   spec.add_dependency "win32-service", "= 0.8.8"
 
+  spec.add_development_dependency "puppetlabs_spec_helper", "~> 2.5"
   spec.add_development_dependency "bundler", "~> 1.14"
   spec.add_development_dependency "rake", "~> 10.0"
   spec.add_development_dependency "rspec", "~> 3.0"

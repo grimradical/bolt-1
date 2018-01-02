@@ -5,16 +5,18 @@ require 'logger'
 require 'json'
 require 'bolt/node'
 require 'bolt/version'
+require 'bolt/error'
 require 'bolt/executor'
+require 'bolt/outputter'
 require 'bolt/config'
 require 'io/console'
 
 module Bolt
-  class CLIError < RuntimeError
+  class CLIError < Bolt::Error
     attr_reader :error_code
 
     def initialize(msg, error_code: 1)
-      super(msg)
+      super(msg, "bolt/cli-error")
       @error_code = error_code
     end
   end
@@ -87,6 +89,7 @@ HELP
     MODES = %w[command script task plan file].freeze
     ACTIONS = %w[run upload download].freeze
     TRANSPORTS = %w[ssh winrm pcp].freeze
+    BOLTLIB_PATH = File.join(__FILE__, '../../../modules')
 
     attr_reader :parser, :config
     attr_accessor :options
@@ -94,9 +97,7 @@ HELP
     def initialize(argv)
       @argv    = argv
       @options = {
-        nodes: [],
-        insecure: false,
-        transport: 'ssh'
+        nodes: []
       }
       @config = Bolt::Config.new
       @parser = create_option_parser(@options)
@@ -134,11 +135,18 @@ HELP
             results[:password] = password
           end
         end
-        results[:concurrency] = 100
+        opts.on('--private-key KEY',
+                "Private ssh key to authenticate with (Optional)") do |key|
+          results[:key] = key
+        end
         opts.on('-c', '--concurrency CONCURRENCY', Integer,
                 "Maximum number of simultaneous connections " \
                 "(Optional, defaults to 100)") do |concurrency|
           results[:concurrency] = concurrency
+        end
+        opts.on('--connect-timeout TIMEOUT', Integer,
+                "Connection timeout (Optional)") do |timeout|
+          results[:connect_timeout] = timeout
         end
         opts.on('--modulepath MODULES',
                 "List of directories containing modules, " \
@@ -149,6 +157,11 @@ HELP
                 "Parameters to a task or plan") do |params|
           results[:task_options] = parse_params(params)
         end
+
+        opts.on('--format FORMAT',
+                "Output format to use: human or json") do |format|
+          results[:format] = format
+        end
         opts.on('-k', '--insecure',
                 "Whether to connect insecurely ") do |insecure|
           results[:insecure] = insecure
@@ -156,6 +169,29 @@ HELP
         opts.on('--transport TRANSPORT', TRANSPORTS,
                 "Specify a default transport: #{TRANSPORTS.join(', ')}") do |t|
           options[:transport] = t
+        end
+        opts.on('--run-as USER',
+                "User to run as using privilege escalation") do |user|
+          options[:run_as] = user
+        end
+        opts.on('--sudo [PROGRAM]',
+                "Program to execute for privilege escalation. " \
+                "Currently only sudo is supported.") do |program|
+          options[:sudo] = program || 'sudo'
+        end
+        opts.on('--sudo-password [PASSWORD]',
+                'Password for privilege escalation') do |password|
+          if password.nil?
+            STDOUT.print "Please enter your privilege escalation password: "
+            results[:sudo_password] = STDIN.noecho(&:gets).chomp
+            STDOUT.puts
+          else
+            results[:sudo_password] = password
+          end
+        end
+        opts.on('--configfile CONFIG_PATH',
+                'Specify where to load the config file from') do |path|
+          results[:configfile] = path
         end
         opts.on_tail('--[no-]tty',
                      "Request a pseudo TTY on nodes that support it") do |tty|
@@ -186,6 +222,7 @@ HELP
         parser.permute(@argv)
       end
 
+      # Shortcut to handle help before other errors may be generated
       options[:mode] = remaining.shift
 
       if options[:mode] == 'help'
@@ -193,19 +230,19 @@ HELP
         options[:mode] = remaining.shift
       end
 
-      options[:action] = remaining.shift
-      options[:object] = remaining.shift
-
-      if options[:debug]
-        @config[:log_level] = Logger::DEBUG
-      elsif options[:verbose]
-        @config[:log_level] = Logger::INFO
-      end
-
       if options[:help]
         print_help(options[:mode])
         raise Bolt::CLIExit
       end
+
+      @config.load_file(options[:configfile])
+      @config.update_from_cli(options)
+      @config.validate
+
+      # This section handles parsing non-flag options which are
+      # mode specific rather then part of the config
+      options[:action] = remaining.shift
+      options[:object] = remaining.shift
 
       task_options, remaining = remaining.partition { |s| s =~ /.+=/ }
       if options[:task_options]
@@ -311,7 +348,7 @@ HELP
         raise Bolt::CLIError, "Option '--nodes' must be specified"
       end
 
-      if %w[task plan].include?(options[:mode]) && options[:modulepath].nil?
+      if %w[task plan].include?(options[:mode]) && @config[:modulepath].nil?
         raise Bolt::CLIError,
               "Option '--modulepath' must be specified when running" \
               " a task or plan"
@@ -327,10 +364,6 @@ HELP
     end
 
     def execute(options)
-      %i[concurrency user password tty insecure transport].each do |key|
-        config[key] = options[key]
-      end
-
       if options[:mode] == 'plan' || options[:mode] == 'task'
         begin
           require_relative '../../vendored/require_vendored'
@@ -354,25 +387,35 @@ HELP
         nodes = executor.from_uris(options[:nodes])
 
         results = nil
+        outputter.print_head
+
         elapsed_time = Benchmark.realtime do
           results =
             case options[:mode]
             when 'command'
-              executor.run_command(nodes, options[:object])
+              executor.run_command(nodes, options[:object]) do |node, event|
+                outputter.print_event(node, event)
+              end
             when 'script'
               script = options[:object]
               validate_file('script', script)
-              executor.run_script(nodes, script, options[:leftovers])
+              executor.run_script(
+                nodes, script, options[:leftovers]
+              ) do |node, event|
+                outputter.print_event(node, event)
+              end
             when 'task'
               task_name = options[:object]
 
-              path, metadata = load_task_data(task_name, options[:modulepath])
+              path, metadata = load_task_data(task_name, @config[:modulepath])
               input_method = metadata['input_method']
 
               input_method ||= 'both'
               executor.run_task(
                 nodes, path, input_method, options[:task_options]
-              )
+              ) do |node, event|
+                outputter.print_event(node, event)
+              end
             when 'file'
               src = options[:object]
               dest = options[:leftovers].first
@@ -381,44 +424,29 @@ HELP
                 raise Bolt::CLIError, "A destination path must be specified"
               end
               validate_file('source file', src)
-              executor.file_upload(nodes, src, dest)
+              executor.file_upload(nodes, src, dest) do |node, event|
+                outputter.print_event(node, event)
+              end
             end
         end
 
-        print_results(results, elapsed_time)
+        outputter.print_summary(results, elapsed_time)
       end
+    rescue Bolt::CLIError => e
+      outputter.fatal_error(e)
+      raise e
     end
 
     def execute_plan(executor, options)
+      # Plans return null here?
       result = Puppet.override(bolt_executor: executor) do
         run_plan(options[:object],
                  options[:task_options],
-                 options[:modulepath])
+                 @config[:modulepath])
       end
-      puts result
+      outputter.print_plan(result)
     rescue Puppet::Error
       raise Bolt::CLIError, "Exiting because of an error in Puppet code"
-    end
-
-    def colorize(result, stream)
-      color = result.success? ? "\033[32m" : "\033[31m"
-      stream.print color if stream.isatty
-      yield
-      stream.print "\033[0m" if stream.isatty
-    end
-
-    def print_results(results, elapsed_time)
-      results.each_pair do |node, result|
-        colorize(result, $stdout) { $stdout.puts "#{node.host}:" }
-        $stdout.puts
-        $stdout.puts result.message
-        $stdout.puts
-      end
-
-      $stdout.puts format("Ran on %d node%s in %.2f seconds",
-                          results.size,
-                          results.size > 1 ? 's' : '',
-                          elapsed_time)
     end
 
     def validate_file(type, path)
@@ -439,6 +467,10 @@ HELP
 
     def file_stat(path)
       File.stat(path)
+    end
+
+    def outputter
+      @outputter ||= Bolt::Outputter.for_format(@config[:format])
     end
 
     def load_task_data(name, modulepath)
@@ -482,8 +514,10 @@ HELP
           cli << "--#{setting}" << dir
         end
         Puppet.initialize_settings(cli)
-        Puppet::Pal.in_tmp_environment('bolt', modulepath: modulepath) do |pal|
-          puts pal.run_plan(plan, plan_args: args)
+        Puppet::Pal.in_tmp_environment('bolt', modulepath: [BOLTLIB_PATH] + modulepath, facts: {}) do |pal|
+          pal.with_script_compiler do |compiler|
+            compiler.call_function('run_plan', plan, args)
+          end
         end
       end
     end

@@ -1,8 +1,8 @@
 require 'json'
 require 'shellwords'
 require 'net/ssh'
-require 'net/sftp'
-require 'bolt/node/result'
+require 'net/scp'
+require 'bolt/node/output'
 
 module Bolt
   class SSH < Node
@@ -14,6 +14,10 @@ module Bolt
       }
     end
 
+    def protocol
+      'ssh'
+    end
+
     def connect
       options = {
         logger: @transport_logger,
@@ -22,11 +26,13 @@ module Bolt
 
       options[:port] = @port if @port
       options[:password] = @password if @password
+      options[:keys] = @key if @key
       options[:verify_host_key] = if @insecure
                                     Net::SSH::Verifiers::Lenient.new
                                   else
                                     Net::SSH::Verifiers::Secure.new
                                   end
+      options[:timeout] = @connect_timeout if @connect_timeout
 
       @session = Net::SSH.start(@host, @user, options)
       @logger.debug { "Opened session" }
@@ -39,6 +45,11 @@ module Bolt
       raise Bolt::Node::ConnectError.new(
         "Host key verification failed for #{@uri}: #{e.message}",
         'HOST_KEY_ERROR'
+      )
+    rescue Net::SSH::ConnectionTimeout
+      raise Bolt::Node::ConnectError.new(
+        "Timeout after #{@connect_timeout} seconds connecting to #{@uri}",
+        'CONNECT_ERROR'
       )
     rescue StandardError => e
       raise Bolt::Node::ConnectError.new(
@@ -54,9 +65,49 @@ module Bolt
       end
     end
 
-    def execute(command, options = {})
-      result_output = Bolt::Node::ResultOutput.new
-      status = {}
+    def sudo_prompt
+      '[sudo] Bolt needs to run as another user, password: '
+    end
+
+    def handled_sudo(channel, data)
+      if data == sudo_prompt
+        if @sudo_password
+          channel.send_data "#{@sudo_password}\n"
+          channel.wait
+          return true
+        else
+          raise Bolt::Node::EscalateError.new(
+            "Sudo password for user #{@user} was not provided for #{@uri}",
+            'NO_PASSWORD'
+          )
+        end
+      elsif data =~ /^#{@user} is not in the sudoers file\./
+        @logger.info { data }
+        raise Bolt::Node::EscalateError.new(
+          "User #{@user} does not have sudo permission on #{@uri}",
+          'SUDO_DENIED'
+        )
+      elsif data =~ /^Sorry, try again\./
+        @logger.info { data }
+        raise Bolt::Node::EscalateError.new(
+          "Sudo password for user #{@user} not recognized on #{@uri}",
+          'BAD_PASSWORD'
+        )
+      end
+      false
+    end
+
+    def execute(command, sudoable: false, **options)
+      result_output = Bolt::Node::Output.new
+      use_sudo = sudoable && (@sudo || @run_as)
+      if use_sudo
+        user_clause = if @run_as
+                        "-u #{@run_as}"
+                      else
+                        ''
+                      end
+        command = "sudo -S #{user_clause} -p '#{sudo_prompt}' #{command}"
+      end
 
       @logger.debug { "Executing: #{command}" }
 
@@ -65,20 +116,29 @@ module Bolt
         channel.request_pty if @tty
 
         channel.exec(command) do |_, success|
-          raise "could not execute command: #{command.inspect}" unless success
+          unless success
+            raise Bolt::Node::ConnectError.new(
+              "Could not execute command: #{command.inspect}",
+              'EXEC_ERROR'
+            )
+          end
 
           channel.on_data do |_, data|
-            result_output.stdout << data
+            unless use_sudo && handled_sudo(channel, data)
+              result_output.stdout << data
+            end
             @logger.debug { "stdout: #{data}" }
           end
 
           channel.on_extended_data do |_, _, data|
-            result_output.stderr << data
+            unless use_sudo && handled_sudo(channel, data)
+              result_output.stderr << data
+            end
             @logger.debug { "stderr: #{data}" }
           end
 
           channel.on_request("exit-status") do |_, data|
-            status[:exit_code] = data.read_long
+            result_output.exit_code = data.read_long
           end
 
           if options[:stdin]
@@ -89,55 +149,107 @@ module Bolt
       end
       session_channel.wait
 
-      if status[:exit_code].zero?
+      if result_output.exit_code == 0
         @logger.debug { "Command returned successfully" }
-        Bolt::Node::Success.new(result_output.stdout.string, result_output)
       else
-        @logger.info { "Command failed with exit code #{status[:exit_code]}" }
-        Bolt::Node::Failure.new(status[:exit_code], result_output)
+        @logger.info { "Command failed with exit code #{result_output.exit_code}" }
       end
+      result_output
     end
 
     def _upload(source, destination)
-      Net::SFTP::Session.new(@session).connect! do |sftp|
-        sftp.upload!(source, destination)
-      end
-      Bolt::Node::Success.new
+      write_remote_file(source, destination)
+      Bolt::Result.new
     rescue StandardError => e
-      Bolt::Node::ExceptionFailure.new(e)
+      Bolt::Result.from_exception(e)
+    end
+
+    def write_remote_file(source, destination)
+      @session.scp.upload!(source, destination)
+    rescue StandardError => e
+      raise FileError.new(e.message, 'WRITE_ERROR')
     end
 
     def make_tempdir
-      Bolt::Node::Success.new(@session.exec!('mktemp -d').chomp)
-    rescue StandardError => e
-      Bolt::Node::ExceptionFailure.new(e)
+      result = execute('mktemp -d')
+      if result.exit_code != 0
+        raise FileError.new("Could not make tempdir: #{result.stderr.string}", 'TEMPDIR_ERROR')
+      end
+      result.stdout.string.chomp
+    end
+
+    def with_remote_tempdir
+      dir = make_tempdir
+      begin
+        yield dir
+      ensure
+        output =  execute("rm -rf '#{dir}'")
+        if output.exit_code != 0
+          logger.warn("Failed to clean up tempdir '#{dir}': #{output.stderr.string}")
+        end
+      end
+    end
+
+    def with_remote_script(dir, file)
+      remote_path = "#{dir}/#{File.basename(file)}"
+      write_remote_file(file, remote_path)
+      make_executable(remote_path)
+      yield remote_path
     end
 
     def with_remote_file(file)
-      remote_path = ''
-      dir = ''
-      result = nil
+      with_remote_tempdir do |dir|
+        with_remote_script(dir, file) do |remote_path|
+          yield remote_path
+        end
+      end
+    end
 
-      make_tempdir.then do |value|
-        dir = value
-        remote_path = "#{dir}/#{File.basename(file)}"
-        Bolt::Node::Success.new
-      end.then do
-        _upload(file, remote_path)
-      end.then do
-        execute("chmod u+x '#{remote_path}'")
-      end.then do
-        result = yield remote_path
-      end.then do
-        execute("rm -f '#{remote_path}'")
-      end.then do
-        execute("rmdir '#{dir}'")
-        result
+    def make_wrapper_stringio(task_path, stdin)
+      StringIO.new(<<-SCRIPT)
+#!/bin/sh
+'#{task_path}' <<EOF
+#{stdin}
+EOF
+SCRIPT
+    end
+
+    def make_executable(path)
+      result = execute("chmod u+x '#{path}'")
+      if result.exit_code != 0
+        raise FileError.new("Could not make file '#{path}' executable: #{result.stderr.string}", 'CHMOD_ERROR')
+      end
+    end
+
+    def with_task_wrapper(remote_task, dir, stdin)
+      wrapper = make_wrapper_stringio(remote_task, stdin)
+      command = "#{dir}/wrapper.sh"
+      write_remote_file(wrapper, command)
+      make_executable(command)
+      yield command
+    end
+
+    def with_remote_task(task_file, stdin)
+      with_remote_tempdir do |dir|
+        with_remote_script(dir, task_file) do |remote_task|
+          if stdin
+            with_task_wrapper(remote_task, dir, stdin) do |command|
+              yield command
+            end
+          else
+            yield remote_task
+          end
+        end
       end
     end
 
     def _run_command(command)
-      execute(command)
+      output = execute(command, sudoable: true)
+      Bolt::CommandResult.from_output(output)
+    # TODO: We should be able to rely on the excutor for this but it will mean
+    # a test refactor
+    rescue StandardError => e
+      Bolt::Result.from_exception(e)
     end
 
     def _run_script(script, arguments)
@@ -145,8 +257,14 @@ module Bolt
       @logger.debug { "arguments: #{arguments}" }
 
       with_remote_file(script) do |remote_path|
-        execute("'#{remote_path}' #{Shellwords.join(arguments)}")
+        output = execute("'#{remote_path}' #{Shellwords.join(arguments)}",
+                         sudoable: true)
+        Bolt::CommandResult.from_output(output)
       end
+    # TODO: We should be able to rely on the excutor for this but it will mean
+    # a test refactor
+    rescue StandardError => e
+      Bolt::Result.from_exception(e)
     end
 
     def _run_task(task, input_method, arguments)
@@ -166,14 +284,19 @@ module Bolt
         end.join(' ')
       end
 
-      with_remote_file(task) do |remote_path|
+      with_remote_task(task, stdin) do |remote_path|
         command = if export_args.empty?
                     "'#{remote_path}'"
                   else
-                    "export #{export_args} && '#{remote_path}'"
+                    "#{export_args} '#{remote_path}'"
                   end
-        execute(command, stdin: stdin)
+        output = execute(command, sudoable: true)
+        Bolt::TaskResult.from_output(output)
       end
+    # TODO: We should be able to rely on the excutor for this but it will mean
+    # a test refactor
+    rescue StandardError => e
+      Bolt::Result.from_exception(e)
     end
   end
 end

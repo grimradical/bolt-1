@@ -29,17 +29,24 @@ module Bolt
 
     def self.initialize_transport(_logger); end
 
-    attr_reader :logger, :host, :uri, :user, :password
+    attr_reader :logger, :host, :uri, :user, :password, :connect_timeout
 
     def initialize(host, port = nil, user = nil, password = nil, uri: nil,
                    config: Bolt::Config.new)
       @host = host
       @port = port
-      @user = user || config[:user]
-      @password = password || config[:password]
-      @tty = config[:tty]
-      @insecure = config[:insecure]
       @uri = uri
+
+      transport_conf = config[:transports][protocol.to_sym]
+      @user = user || transport_conf[:user]
+      @password = password || transport_conf[:password]
+      @key = transport_conf[:key]
+      @tty = transport_conf[:tty]
+      @insecure = transport_conf[:insecure]
+      @connect_timeout = transport_conf[:connect_timeout]
+      @sudo = transport_conf[:sudo]
+      @sudo_password = transport_conf[:sudo_password]
+      @run_as = transport_conf[:run_as]
 
       @logger = init_logger(config[:log_destination], config[:log_level])
       @transport_logger = init_logger(config[:log_destination], Logger::WARN)
@@ -57,23 +64,24 @@ module Bolt
       @logger.debug { "Uploading #{source} to #{destination}" }
       result = _upload(source, destination)
       if result.success?
-        Bolt::Result.new("Uploaded '#{source}' to '#{host}:#{destination}'")
+        Bolt::Result.new(nil, "Uploaded '#{source}' to '#{host}:#{destination}'")
       else
-        result.to_result
+        result
       end
     end
 
     def run_command(command)
       @logger.info { "Running command: #{command}" }
-      _run_command(command).to_command_result
+      _run_command(command)
     end
 
     def run_script(script, arguments)
-      _run_script(script, arguments).to_command_result
+      @logger.info { "Running script: #{script}" }
+      _run_script(script, arguments)
     end
 
     def run_task(task, input_method, arguments)
-      _run_task(task, input_method, arguments).to_task_result
+      _run_task(task, input_method, arguments)
     end
   end
 end
